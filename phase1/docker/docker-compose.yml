@@ -1,0 +1,264 @@
+version: '3.8'
+
+services:
+
+  # ── Kafka Infrastructure ──────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - sherin-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - sherin-network
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: sherin-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      - kafka
+    networks:
+      - sherin-network
+
+  # ── Storage ───────────────────────────────────────────────────────────────
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    environment:
+      POSTGRES_DB: sherin
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    networks:
+      - sherin-network
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: sherin
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    networks:
+      - sherin-network
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - sherin-network
+
+  # ── News Ingestion Services ───────────────────────────────────────────────
+  reuters-ingestor:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ingestor
+    command: python ingestion/reuters_ingestor.py
+    environment:
+      KAFKA_BROKER: kafka:9092
+      REUTERS_API_KEY: ${REUTERS_API_KEY}
+    depends_on:
+      - kafka
+    networks:
+      - sherin-network
+    restart: unless-stopped
+
+  bloomberg-ingestor:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ingestor
+    command: python ingestion/bloomberg_ingestor.py
+    environment:
+      KAFKA_BROKER: kafka:9092
+      BLOOMBERG_API_KEY: ${BLOOMBERG_API_KEY}
+    depends_on:
+      - kafka
+    networks:
+      - sherin-network
+    restart: unless-stopped
+
+  rss-ingestor:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ingestor
+    command: python ingestion/rss_ingestor.py
+    environment:
+      KAFKA_BROKER: kafka:9092
+      CNBC_RSS_URL: "https://www.cnbc.com/id/100003114/device/rss/rss.html"
+      FT_RSS_URL: "https://www.ft.com/?format=rss"
+    depends_on:
+      - kafka
+    networks:
+      - sherin-network
+    restart: unless-stopped
+
+  # ── Market Data Services ──────────────────────────────────────────────────
+  binance-ingestor:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ingestor
+    command: python ingestion/binance_ingestor.py
+    environment:
+      KAFKA_BROKER: kafka:9092
+      BINANCE_SYMBOL: btcusdt
+    depends_on:
+      - kafka
+    networks:
+      - sherin-network
+    restart: unless-stopped
+
+  polygon-ingestor:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ingestor
+    command: python ingestion/polygon_ingestor.py
+    environment:
+      KAFKA_BROKER: kafka:9092
+      POLYGON_API_KEY: ${POLYGON_API_KEY}
+      POLYGON_SYMBOLS: "AAPL,MSFT,TSLA,NVDA"
+    depends_on:
+      - kafka
+    networks:
+      - sherin-network
+    restart: unless-stopped
+
+  market-aggregator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ingestor
+    command: python processing/market_aggregator.py
+    environment:
+      KAFKA_BROKER: kafka:9092
+      TIMESCALE_CONN: "dbname=sherin user=postgres host=timescaledb password=postgres"
+    depends_on:
+      - kafka
+      - timescaledb
+    networks:
+      - sherin-network
+    restart: unless-stopped
+
+  # ── NLP Processing ────────────────────────────────────────────────────────
+  nlp-processor:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.nlp
+    command: python processing/nlp_processor.py
+    environment:
+      KAFKA_BROKER: kafka:9092
+      ELASTICSEARCH_HOST: elasticsearch
+      ELASTICSEARCH_PORT: "9200"
+    depends_on:
+      - kafka
+      - elasticsearch
+    networks:
+      - sherin-network
+    restart: unless-stopped
+
+  # ── Macro Data (Airflow) ──────────────────────────────────────────────────
+  airflow:
+    image: apache/airflow:2.8.0
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres@postgres/sherin
+      FRED_API_KEY: ${FRED_API_KEY}
+      POSTGRES_CONN: "dbname=sherin user=postgres host=postgres password=postgres"
+    volumes:
+      - ../ingestion/fred_ingestor.py:/opt/airflow/dags/fred_ingestor.py
+    ports:
+      - "8081:8080"
+    depends_on:
+      - postgres
+    networks:
+      - sherin-network
+
+  # ── Monitoring ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - sherin-network
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: sherin123
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - sherin-network
+
+  metrics-exporter:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ingestor
+    command: python monitoring/prometheus_metrics.py
+    environment:
+      METRICS_PORT: "8000"
+      POSTGRES_CONN: "dbname=sherin user=postgres host=postgres password=postgres"
+      TIMESCALE_CONN: "dbname=sherin user=postgres host=timescaledb password=postgres"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - timescaledb
+    networks:
+      - sherin-network
+
+volumes:
+  timescale_data:
+  postgres_data:
+  es_data:
+  grafana_data:
+
+networks:
+  sherin-network:
+    driver: bridge
